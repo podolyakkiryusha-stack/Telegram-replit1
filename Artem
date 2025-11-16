@@ -1,0 +1,319 @@
+import logging
+import json
+import uuid
+from typing import List, Dict, Any
+
+import httpx
+from geopy.distance import geodesic
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# ======================== НАСТРОЙКИ ===========================
+TOKEN = "8494036212:AAHNR8u-nqAmKHZV_QmOlL0yZDfmcpVPeCI"
+
+ADMIN_IDS = [348516917, 343772891]
+
+QUESTIONS_FILE = "questions.json"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ======================== ХРАНЕНИЕ ДАННЫХ ======================
+def load_questions():
+    try:
+        with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def save_questions(data):
+    with open(QUESTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ======================== КНОПКИ ==============================
+def get_main_keyboard(is_admin=False):
+    kb = [
+        ["💬 Консультация специалиста"],
+        ["💊 Сайт для заказа препаратов"],
+        ["📍 Аптеки рядом"],
+    ]
+    if is_admin:
+        kb.append(["⚙️ Админ-панель"])
+
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+
+# ======================== START ================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.chat_id
+    await update.message.reply_text(
+        "Привет! Выберите действие:",
+        reply_markup=get_main_keyboard(uid in ADMIN_IDS),
+    )
+
+
+# ======================== ПОЛЬЗОВАТЕЛИ =========================
+async def handle_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    uid = update.message.chat_id
+
+    # Консультация
+    if text == "💬 Консультация специалиста":
+        await update.message.reply_text("Введите ваш вопрос:", reply_markup=ReplyKeyboardRemove())
+        context.user_data["awaiting_question"] = True
+        return
+
+    # — Ввод вопроса —
+    if context.user_data.get("awaiting_question"):
+        context.user_data.pop("awaiting_question")
+
+        questions = load_questions()
+
+        qid = str(uuid.uuid4())
+        question_text = update.message.text
+
+        questions.append({
+            "id": qid,
+            "user_id": uid,
+            "question": question_text,
+            "status": "новый",
+        })
+        save_questions(questions)
+
+        # отправка админам
+        for admin in ADMIN_IDS:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Ответить", callback_data=f"reply:{qid}")]
+            ])
+            await context.bot.send_message(
+                chat_id=admin,
+                text=f"📩 Новый вопрос от {uid}\n\n{question_text}",
+                reply_markup=kb,
+            )
+
+        await update.message.reply_text(
+            "Ваш вопрос отправлен специалисту!",
+            reply_markup=get_main_keyboard(uid in ADMIN_IDS),
+        )
+        return
+
+    # Сайт
+    if text == "💊 Сайт для заказа препаратов":
+        await update.message.reply_text(
+            "Сайт для заказа: https://pharma.by",
+            reply_markup=get_main_keyboard(uid in ADMIN_IDS),
+        )
+        return
+
+    # Аптеки
+    if text == "📍 Аптеки рядом":
+        kb = ReplyKeyboardMarkup(
+            [[{"text": "Отправить геолокацию", "request_location": True}]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        context.user_data["awaiting_location"] = True
+        await update.message.reply_text("Отправьте свою геолокацию:", reply_markup=kb)
+        return
+
+    # Админ-панель
+    if uid in ADMIN_IDS and text == "⚙️ Админ-панель":
+        await show_admin_panel(update, context)
+        return
+
+
+# ======================== АДМИН-ПАНЕЛЬ =========================
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    questions = load_questions()
+
+    if not questions:
+        await update.message.reply_text("Нет вопросов.")
+        return
+
+    kb = []
+    for q in questions:
+        mark = "🆕" if q["status"] == "новый" else "✔️"
+        kb.append([InlineKeyboardButton(f"{mark} {q['user_id']}", callback_data=f"show:{q['id']}")])
+
+    await update.message.reply_text(
+        "Список вопросов:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+# ======================== INLINE-КНОПКИ ========================
+async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cmd, qid = query.data.split(":", 1)
+
+    questions = load_questions()
+
+    # показать вопрос
+    if cmd == "show":
+        for q in questions:
+            if q["id"] == qid:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Ответить", callback_data=f"reply:{qid}")]
+                ])
+                await query.message.reply_text(
+                    f"Вопрос:\n{q['question']}\nСтатус: {q['status']}",
+                    reply_markup=kb,
+                )
+                return
+
+    # начать ответ
+    if cmd == "reply":
+        context.user_data["reply_to"] = qid
+        await query.message.reply_text("Введите ответ пользователю:")
+        return
+
+
+# ======================== ОТВЕТ АДМИНА =========================
+async def handle_admin_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.chat_id
+    if uid not in ADMIN_IDS:
+        return
+
+    if "reply_to" not in context.user_data:
+        return
+
+    qid = context.user_data.pop("reply_to")
+
+    questions = load_questions()
+
+    # ищем вопрос
+    for q in questions:
+        if q["id"] == qid:
+            user_id = q["user_id"]
+
+            # отправка ответа пользователю
+            if update.message.text:
+                await update.message.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📨 Ответ специалиста:\n{update.message.text}"
+                )
+            elif update.message.photo:
+                await update.message.bot.send_photo(
+                    chat_id=user_id,
+                    photo=update.message.photo[-1].file_id,
+                    caption="📨 Ответ специалиста"
+                )
+            elif update.message.document:
+                await update.message.bot.send_document(
+                    chat_id=user_id,
+                    document=update.message.document.file_id,
+                    caption="📨 Ответ специалиста"
+                )
+
+            # ОБНОВЛЯЕМ СТАТУС
+            q["status"] = "отвечен"
+            save_questions(questions)
+
+            # сообщение админу
+            await update.message.reply_text("Ответ отправлен!")
+
+            # кнопки пользователю
+            await update.message.bot.send_message(
+                chat_id=user_id,
+                text="Вы можете задать новый вопрос:",
+                reply_markup=get_main_keyboard(user_id in ADMIN_IDS),
+            )
+            return
+
+
+# ======================== ГЕОЛОКАЦИЯ ==========================
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_location"):
+        return
+    context.user_data.pop("awaiting_location")
+
+    loc = update.message.location
+    user_coords = (loc.latitude, loc.longitude)
+
+    overpass_query = f"""
+    [out:json][timeout:25];
+    (
+      node["amenity"="pharmacy"](around:2000,{loc.latitude},{loc.longitude});
+      way["amenity"="pharmacy"](around:2000,{loc.latitude},{loc.longitude});
+    );
+    out center;
+    """
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("https://overpass-api.de/api/interpreter", data=overpass_query)
+        data = r.json()
+
+    if not data.get("elements"):
+        await update.message.reply_text("Аптеки не найдены 😔")
+        return
+
+    results = []
+    for e in data["elements"]:
+        if "lat" in e:
+            coords = (e["lat"], e["lon"])
+        else:
+            coords = (e["center"]["lat"], e["center"]["lon"])
+
+        name = e.get("tags", {}).get("name", "Аптека")
+        dist = int(geodesic(user_coords, coords).meters)
+
+        results.append((dist, name, coords))
+
+    results.sort(key=lambda x: x[0])
+
+    for dist, name, (la, lo) in results[:10]:
+        await update.message.bot.send_venue(
+            chat_id=update.message.chat_id,
+            latitude=la,
+            longitude=lo,
+            title=name,
+            address=f"{name} — {dist} м"
+        )
+
+    await update.message.reply_text(
+        "Готово!",
+        reply_markup=get_main_keyboard(update.message.chat_id in ADMIN_IDS),
+    )
+
+
+# ======================== ЗАПУСК ===============================
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(15)
+        .read_timeout(25)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(inline_callback))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_admin_response))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user))
+
+    logger.info("Бот запущен...")
+    app.run_polling(stop_signals=None)
+
+
+if __name__ == "__main__":
+    main()
